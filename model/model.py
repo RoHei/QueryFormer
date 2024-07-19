@@ -1,25 +1,27 @@
 import torch
-from torch.utils.data import Dataset
-import json
-import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Prediction(nn.Module):
-    def __init__(self, in_feature = 69, hid_units = 256, contract = 1, mid_layers = True, res_con = True):
-        super(Prediction, self).__init__()
+from model.database_util import Batch
+
+
+class FinalPredictionLayer(nn.Module):
+    def __init__(self,
+                 in_feature: int = 69,
+                 hid_units: int = 256,
+                 contract: int = 1,
+                 mid_layers: bool = True,
+                 res_con: bool = True):
+
+        super(FinalPredictionLayer, self).__init__()
         self.mid_layers = mid_layers
         self.res_con = res_con
-        
         self.out_mlp1 = nn.Linear(in_feature, hid_units)
-
-        self.mid_mlp1 = nn.Linear(hid_units, hid_units//contract)
-        self.mid_mlp2 = nn.Linear(hid_units//contract, hid_units)
-
+        self.mid_mlp1 = nn.Linear(hid_units, hid_units // contract)
+        self.mid_mlp2 = nn.Linear(hid_units // contract, hid_units)
         self.out_mlp2 = nn.Linear(hid_units, 1)
 
     def forward(self, features):
-        
         hid = F.relu(self.out_mlp1(features))
         if self.mid_layers:
             mid = F.relu(self.mid_mlp1(hid))
@@ -29,212 +31,211 @@ class Prediction(nn.Module):
             else:
                 hid = mid
         out = torch.sigmoid(self.out_mlp2(hid))
-
         return out
 
-        
+
 class FeatureEmbed(nn.Module):
-    def __init__(self, embed_size=32, tables = 10, types=20, joins = 40, columns= 30, \
-                 ops=4, use_sample = True, use_hist = True, bin_number = 50):
+    def __init__(self,
+                 embedding_size: int = 32,
+                 tables: int = 10,
+                 types: int = 20,
+                 joins: int = 40,
+                 columns: int = 30,
+                 ops: int = 4,
+                 use_sample: bool = True,
+                 use_hist: bool = True,
+                 bin_number: int = 50):
+
         super(FeatureEmbed, self).__init__()
-        
         self.use_sample = use_sample
-        self.embed_size = embed_size        
-        
+        self.embed_size = embedding_size
         self.use_hist = use_hist
         self.bin_number = bin_number
-        
-        self.typeEmbed = nn.Embedding(types, embed_size)
-        self.tableEmbed = nn.Embedding(tables, embed_size)
-        
-        self.columnEmbed = nn.Embedding(columns, embed_size)
-        self.opEmbed = nn.Embedding(ops, embed_size//8)
-
-        self.linearFilter2 = nn.Linear(embed_size+embed_size//8+1, embed_size+embed_size//8+1)
-        self.linearFilter = nn.Linear(embed_size+embed_size//8+1, embed_size+embed_size//8+1)
-
-        self.linearType = nn.Linear(embed_size, embed_size)
-        
-        self.linearJoin = nn.Linear(embed_size, embed_size)
-        
-        self.linearSample = nn.Linear(1000, embed_size)
-        
-        self.linearHist = nn.Linear(bin_number, embed_size)
-
-        self.joinEmbed = nn.Embedding(joins, embed_size)
-        
+        self.typeEmbed = nn.Embedding(types, embedding_size)
+        self.tableEmbed = nn.Embedding(tables, embedding_size)
+        self.columnEmbed = nn.Embedding(columns, embedding_size)
+        self.opEmbed = nn.Embedding(ops, embedding_size // 8)
+        self.linearFilter2 = nn.Linear(embedding_size + embedding_size // 8 + 1, embedding_size + embedding_size // 8 + 1)
+        self.linearFilter = nn.Linear(embedding_size + embedding_size // 8 + 1, embedding_size + embedding_size // 8 + 1)
+        self.linearType = nn.Linear(embedding_size, embedding_size)
+        self.linearJoin = nn.Linear(embedding_size, embedding_size)
+        self.linearSample = nn.Linear(1000, embedding_size)
+        self.linearHist = nn.Linear(bin_number, embedding_size)
+        self.joinEmbed = nn.Embedding(joins, embedding_size)
         if use_hist:
-            self.project = nn.Linear(embed_size*5 + embed_size//8+1, embed_size*5 + embed_size//8+1)
+            self.project = nn.Linear(embedding_size * 5 + embedding_size // 8 + 1, embedding_size * 5 + embedding_size // 8 + 1)
         else:
-            self.project = nn.Linear(embed_size*4 + embed_size//8+1, embed_size*4 + embed_size//8+1)
-    
-    # input: B by 14 (type, join, f1, f2, f3, mask1, mask2, mask3)
+            self.project = nn.Linear(embedding_size * 4 + embedding_size // 8 + 1, embedding_size * 4 + embedding_size // 8 + 1)
+
     def forward(self, feature):
+        """Input: B by 14 (type, join, f1, f2, f3, mask1, mask2, mask3)"""
+        typeId, joinId, filtersId, filtersMask, hists, table_sample = torch.split(feature, (1, 1, 9, 3, self.bin_number * 3, 1001), dim=-1)
+        type_embedding = self.get_type(typeId)
+        join_embedding = self.getJoin(joinId)
+        filter_embedding = self.get_filter(filtersId, filtersMask)
+        histogram_embedding = self.getHist(hists, filtersMask)
+        table_embedding = self.get_table(table_sample)
 
-        typeId, joinId, filtersId, filtersMask, hists, table_sample = torch.split(feature,(1,1,9,3,self.bin_number*3,1001), dim = -1)
-        
-        typeEmb = self.getType(typeId)
-        joinEmb = self.getJoin(joinId)
-        filterEmbed = self.getFilter(filtersId, filtersMask)
-        
-        histEmb = self.getHist(hists, filtersMask)
-        tableEmb = self.getTable(table_sample)
-    
         if self.use_hist:
-            final = torch.cat((typeEmb, filterEmbed, joinEmb, tableEmb, histEmb), dim = 1)
+            final = torch.cat((type_embedding, filter_embedding, join_embedding, table_embedding, histogram_embedding), dim=1)
         else:
-            final = torch.cat((typeEmb, filterEmbed, joinEmb, tableEmb), dim = 1)
+            final = torch.cat((type_embedding, filter_embedding, join_embedding, table_embedding), dim=1)
         final = F.leaky_relu(self.project(final))
-        
         return final
-    
-    def getType(self, typeId):
-        emb = self.typeEmbed(typeId.long())
 
+    def get_type(self, type_id):
+        emb = self.typeEmbed(type_id.long())
         return emb.squeeze(1)
-    
-    def getTable(self, table_sample):
-        table, sample = torch.split(table_sample,(1,1000), dim = -1)
+
+    def get_table(self, table_sample):
+        table, sample = torch.split(table_sample, (1, 1000), dim=-1)
         emb = self.tableEmbed(table.long()).squeeze(1)
-        
+
         if self.use_sample:
             emb += self.linearSample(sample)
         return emb
-    
-    def getJoin(self, joinId):
-        emb = self.joinEmbed(joinId.long())
 
+    def getJoin(self, join_id):
+        emb = self.joinEmbed(join_id.long())
         return emb.squeeze(1)
 
-    def getHist(self, hists, filtersMask):
+    def getHist(self, hists, filters_mask):
         # batch * 50 * 3
-        histExpand = hists.view(-1,self.bin_number,3).transpose(1,2)
-        
+        histExpand = hists.view(-1, self.bin_number, 3).transpose(1, 2)
+
         emb = self.linearHist(histExpand)
-        emb[~filtersMask.bool()] = 0.  # mask out space holder
-        
-        ## avg by # of filters
-        num_filters = torch.sum(filtersMask,dim = 1)
-        total = torch.sum(emb, dim = 1)
-        avg = total / num_filters.view(-1,1)
-        
+        emb[~filters_mask.bool()] = 0.  # mask out space holder
+
+        # avg by # of filters
+        num_filters = torch.sum(filters_mask, dim=1)
+        total = torch.sum(emb, dim=1)
+        avg = total / num_filters.view(-1, 1)
         return avg
-        
-    def getFilter(self, filtersId, filtersMask):
-        ## get Filters, then apply mask
-        filterExpand = filtersId.view(-1,3,3).transpose(1,2)
-        colsId = filterExpand[:,:,0].long()
-        opsId = filterExpand[:,:,1].long()
-        vals = filterExpand[:,:,2].unsqueeze(-1) # b by 3 by 1
-        
+
+    def get_filter(self, filters_id, filters_mask):
+        # get filters, then apply mask
+        filter_expand = filters_id.view(-1, 3, 3).transpose(1, 2)
+        colsId = filter_expand[:, :, 0].long()
+        opsId = filter_expand[:, :, 1].long()
+        vals = filter_expand[:, :, 2].unsqueeze(-1)  # b by 3 by 1
+
         # b by 3 by embed_dim
-        
         col = self.columnEmbed(colsId)
         op = self.opEmbed(opsId)
-        
-        concat = torch.cat((col, op, vals), dim = -1)
+
+        concat = torch.cat((col, op, vals), dim=-1)
         concat = F.leaky_relu(self.linearFilter(concat))
         concat = F.leaky_relu(self.linearFilter2(concat))
-        
-        ## apply mask
-        concat[~filtersMask.bool()] = 0.
-        
-        ## avg by # of filters
-        num_filters = torch.sum(filtersMask,dim = 1)
-        total = torch.sum(concat, dim = 1)
-        avg = total / num_filters.view(-1,1)
-                
-        return avg
-    
-#     def get_output_size(self):
-#         size = self.embed_size * 5 + self.embed_size // 8 + 1
-#         return size
 
+        # apply mask
+        concat[~filters_mask.bool()] = 0.
+
+        # avg by # of filters
+        num_filters = torch.sum(filters_mask, dim=1)
+        total = torch.sum(concat, dim=1)
+        avg = total / num_filters.view(-1, 1)
+        return avg
 
 
 class QueryFormer(nn.Module):
-    def __init__(self, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
-                 dropout = 0.1, attention_dropout_rate = 0.1, n_layers = 8, \
-                 use_sample = True, use_hist = True, bin_number = 50, \
-                 pred_hid = 256
-                ):
-        
-        super(QueryFormer,self).__init__()
-        if use_hist:
-            hidden_dim = emb_size * 5 + emb_size //8 + 1
+    def __init__(self,
+                 embedding_size: int = 32,
+                 ffn_dim: int = 32,
+                 head_size: int = 8,
+                 dropout: float = 0.1,
+                 attention_dropout_rate: float = 0.1,
+                 n_layers: int = 8,
+                 use_sample: bool = True,
+                 use_histogram: bool = True,
+                 bin_number: int = 50,
+                 hidden_dim_prediction: int = 256):
+
+        super(QueryFormer, self).__init__()
+
+        if use_histogram:
+            hidden_dim = embedding_size * 5 + embedding_size // 8 + 1
         else:
-            hidden_dim = emb_size * 4 + emb_size //8 + 1
+            hidden_dim = embedding_size * 4 + embedding_size // 8 + 1
+
         self.hidden_dim = hidden_dim
         self.head_size = head_size
         self.use_sample = use_sample
-        self.use_hist = use_hist
+        self.use_histogram = use_histogram
 
-        self.rel_pos_encoder = nn.Embedding(64, head_size, padding_idx=0)
+        # Define feature embedding layer
+        self.feature_embedding_layer = FeatureEmbed(embedding_size=embedding_size,
+                                                    use_sample=use_sample,
+                                                    use_hist=use_histogram,
+                                                    bin_number=bin_number)
 
+        # Define encoders for inputs
+        self.relative_position_encoder = nn.Embedding(64, head_size, padding_idx=0)
         self.height_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
-        
+
+        # Define intermediate transformer layers
         self.input_dropout = nn.Dropout(dropout)
-        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size)
-                    for _ in range(n_layers)]
-        self.layers = nn.ModuleList(encoders)
-        
+        self.layers = nn.ModuleList([EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size) for _ in range(n_layers)])
         self.final_ln = nn.LayerNorm(hidden_dim)
-        
         self.super_token = nn.Embedding(1, hidden_dim)
         self.super_token_virtual_distance = nn.Embedding(1, head_size)
-        
-        
-        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
-        
-        self.pred = Prediction(hidden_dim, pred_hid)
 
-        # if multi-task
-        self.pred2 = Prediction(hidden_dim, pred_hid)
-        
-    def forward(self, batched_data):
-        attn_bias, rel_pos, x = batched_data.attn_bias, batched_data.rel_pos, batched_data.x
+        # Define prediction layers
+        self.prediction_layer = FinalPredictionLayer(hidden_dim, hidden_dim_prediction)
+        self.prediction_layer_2 = FinalPredictionLayer(hidden_dim, hidden_dim_prediction)
 
-        heights = batched_data.heights     
-        
-        n_batch, n_node = x.size()[:2]
-        tree_attn_bias = attn_bias.clone()
-        tree_attn_bias = tree_attn_bias.unsqueeze(1).repeat(1, self.head_size, 1, 1) 
-        
-        # rel pos
-        rel_pos_bias = self.rel_pos_encoder(rel_pos).permute(0, 3, 1, 2) # [n_batch, n_node, n_node, n_head] -> [n_batch, n_head, n_node, n_node]
+    def forward(self, batched_data: Batch):
+        # Read batch
+        attention_bias = batched_data.attn_bias
+        rel_pos = batched_data.rel_pos
+        features = batched_data.x
+        heights = batched_data.heights
+        batch_size, number_nodes = features.size()[:2]
+
+        # Shape the attention bias
+        tree_attn_bias = attention_bias.clone()
+        tree_attn_bias = tree_attn_bias.unsqueeze(1).repeat(1, self.head_size, 1, 1)
+
+        # Relative position encoding and rearranging dimensions
+        # [n_batch, n_node, n_node, n_head] -> [# n_batch, n_head, n_node, n_node]
+        rel_pos_bias = self.relative_position_encoder(rel_pos).permute(0, 3, 1, 2)
+
+        # Adding relative position encoding to attention bias but exluding the first position in the last two dimensions
         tree_attn_bias[:, :, 1:, 1:] = tree_attn_bias[:, :, 1:, 1:] + rel_pos_bias
 
-
-        # reset rel pos here
+        # Reset relative position encoding
+        # Reshape the weights of super token virtual distance to the shape of (1, headsize, 1).
+        # This distance is an embedding layer that represents the distance to the super token.
         t = self.super_token_virtual_distance.weight.view(1, self.head_size, 1)
+
+        # Adding reshaped weigths to batches and heads ot of tree_attn_bias,
+        # but only for the first position in the last dimension
         tree_attn_bias[:, :, 1:, 0] = tree_attn_bias[:, :, 1:, 0] + t
         tree_attn_bias[:, :, 0, :] = tree_attn_bias[:, :, 0, :] + t
-        
-        x_view = x.view(-1, 1165)
-        node_feature = self.embbed_layer(x_view).view(n_batch,-1, self.hidden_dim)
-        
-        # -1 is number of dummy
-        
-        node_feature = node_feature + self.height_encoder(heights)
-        super_token_feature = self.super_token.weight.unsqueeze(0).repeat(n_batch, 1, 1)
-        super_node_feature = torch.cat([super_token_feature, node_feature], dim=1)        
-        
-        # transfomrer encoder
+
+        # Embed features
+        features_view = features.view(-1, 1165)
+        embedded_features = self.feature_embedding_layer(features_view).view(batch_size, -1, self.hidden_dim)
+
+        # Add height encoding to the embedded features
+        embedded_features = embedded_features + self.height_encoder(heights)
+
+        # Add super token to the embedded features
+        super_token_feature = self.super_token.weight.unsqueeze(0).repeat(batch_size, 1, 1)
+        super_node_feature = torch.cat([super_token_feature, embedded_features], dim=1)
+
+        # Pass through transformer layers
         output = self.input_dropout(super_node_feature)
         for enc_layer in self.layers:
             output = enc_layer(output, tree_attn_bias)
+
+        # Final layer normalization
         output = self.final_ln(output)
-        
-        return self.pred(output[:,0,:]), self.pred2(output[:,0,:])
-
-
-
+        return self.prediction_layer(output[:, 0, :]), self.prediction_layer_2(output[:, 0, :])
 
 
 class FeedForwardNetwork(nn.Module):
     def __init__(self, hidden_size, ffn_size, dropout_rate):
         super(FeedForwardNetwork, self).__init__()
-
         self.layer1 = nn.Linear(hidden_size, ffn_size)
         self.gelu = nn.GELU()
         self.layer2 = nn.Linear(ffn_size, hidden_size)
@@ -249,22 +250,17 @@ class FeedForwardNetwork(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, attention_dropout_rate, head_size):
         super(MultiHeadAttention, self).__init__()
-
         self.head_size = head_size
-
         self.att_size = att_size = hidden_size // head_size
         self.scale = att_size ** -0.5
-
         self.linear_q = nn.Linear(hidden_size, head_size * att_size)
         self.linear_k = nn.Linear(hidden_size, head_size * att_size)
         self.linear_v = nn.Linear(hidden_size, head_size * att_size)
         self.att_dropout = nn.Dropout(attention_dropout_rate)
-
         self.output_layer = nn.Linear(head_size * att_size, hidden_size)
 
     def forward(self, q, k, v, attn_bias=None):
         orig_q_size = q.size()
-
         d_k = self.att_size
         d_v = self.att_size
         batch_size = q.size(0)
@@ -274,8 +270,8 @@ class MultiHeadAttention(nn.Module):
         k = self.linear_k(k).view(batch_size, -1, self.head_size, d_k)
         v = self.linear_v(v).view(batch_size, -1, self.head_size, d_v)
 
-        q = q.transpose(1, 2)                  # [b, h, q_len, d_k]
-        v = v.transpose(1, 2)                  # [b, h, v_len, d_v]
+        q = q.transpose(1, 2)  # [b, h, q_len, d_k]
+        v = v.transpose(1, 2)  # [b, h, v_len, d_v]
         k = k.transpose(1, 2).transpose(2, 3)  # [b, h, d_k, k_len]
 
         # Scaled Dot-Product Attention.
@@ -284,16 +280,12 @@ class MultiHeadAttention(nn.Module):
         x = torch.matmul(q, k)  # [b, h, q_len, k_len]
         if attn_bias is not None:
             x = x + attn_bias
-
         x = torch.softmax(x, dim=3)
         x = self.att_dropout(x)
         x = x.matmul(v)  # [b, h, q_len, attn]
-
         x = x.transpose(1, 2).contiguous()  # [b, q_len, h, attn]
         x = x.view(batch_size, -1, self.head_size * d_v)
-
         x = self.output_layer(x)
-
         assert x.size() == orig_q_size
         return x
 
@@ -301,11 +293,9 @@ class MultiHeadAttention(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, head_size):
         super(EncoderLayer, self).__init__()
-
         self.self_attention_norm = nn.LayerNorm(hidden_size)
         self.self_attention = MultiHeadAttention(hidden_size, attention_dropout_rate, head_size)
         self.self_attention_dropout = nn.Dropout(dropout_rate)
-
         self.ffn_norm = nn.LayerNorm(hidden_size)
         self.ffn = FeedForwardNetwork(hidden_size, ffn_size, dropout_rate)
         self.ffn_dropout = nn.Dropout(dropout_rate)
@@ -315,32 +305,8 @@ class EncoderLayer(nn.Module):
         y = self.self_attention(y, y, y, attn_bias)
         y = self.self_attention_dropout(y)
         x = x + y
-
         y = self.ffn_norm(x)
         y = self.ffn(y)
         y = self.ffn_dropout(y)
         x = x + y
         return x
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
